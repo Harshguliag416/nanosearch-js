@@ -1,6 +1,6 @@
 {
   "name": "nanosearch-js",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A tiny, super-fast, hybrid search engine for browser, server, and edge runtimes.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -11,10 +11,15 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./rag": {
+      "types": "./dist/rag/index.d.ts",
+      "import": "./dist/rag/index.js",
+      "require": "./dist/rag/index.cjs"
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "build": "tsup",
     "test": "vitest run",
     "bench": "node scripts/bench.js"
   },

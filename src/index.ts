@@ -19,8 +19,11 @@ import { FilterEvaluator, getNestedValue } from './search/filter.js';
 import { GeoSearchManager } from './search/geo.js';
 import { FacetManager } from './search/facet.js';
 import { PluginManager } from './plugins/manager.js';
+import { Transaction } from './core/transaction.js';
+import { VPTree } from './vector/vptree.js';
 
 export * from './types.js';
+export { PorterStemmerPlugin } from './plugins/stemmer.js';
 
 export class NanoSearch<S extends Schema> {
   private schemaCompiler: SchemaCompiler;
@@ -31,6 +34,10 @@ export class NanoSearch<S extends Schema> {
   private geoManager = new GeoSearchManager();
   private facetManager = new FacetManager();
   private pluginManager = new PluginManager();
+  
+  private vpTree?: VPTree;
+  private vectorIndexDirty = false;
+  private vectorIndexType?: 'exact' | 'vptree';
 
   // Document store (id -> document)
   private documents = new Map<string, Document>();
@@ -43,10 +50,12 @@ export class NanoSearch<S extends Schema> {
       b?: number;
       vectorMetric?: 'cosine' | 'dot_product' | 'euclidean';
       vectorDimensions?: number;
+      vectorIndexType?: 'exact' | 'vptree';
     } = {}
   ) {
     this.schemaCompiler = new SchemaCompiler(schema);
     this.tokenizer = config.tokenizer || new Tokenizer();
+    this.vectorIndexType = config.vectorIndexType;
 
     const textFields = Object.entries(schema)
       .filter(([_, conf]) => conf.type === 'text')
@@ -57,6 +66,14 @@ export class NanoSearch<S extends Schema> {
       metric: config.vectorMetric,
       dimensions: config.vectorDimensions
     });
+
+    if (config.vectorIndexType === 'vptree') {
+      const metric = config.vectorMetric || 'cosine';
+      if (metric === 'dot_product') {
+        throw new Error('VP-Tree vector index is not compatible with dot_product metric. Use exact matching instead.');
+      }
+      this.vpTree = new VPTree(metric, (this.vectorIndex as any).vectors);
+    }
   }
 
   /**
@@ -89,6 +106,7 @@ export class NanoSearch<S extends Schema> {
     for (const [field, config] of Object.entries(this.schema)) {
       if (config.type === 'vector' && normalized[field] !== undefined) {
         this.vectorIndex.addVector(docId, normalized[field] as number[] | Float32Array);
+        this.vectorIndexDirty = true;
       }
     }
 
@@ -105,6 +123,44 @@ export class NanoSearch<S extends Schema> {
   }
 
   /**
+   * Bulk index multiple documents.
+   */
+  public addBulk(docs: Document[]): void {
+    const len = docs.length;
+    for (let i = 0; i < len; i++) {
+      const doc = docs[i];
+      const rawDoc = this.pluginManager.runBeforeAdd(doc);
+      const normalized = this.schemaCompiler.validateAndNormalize(rawDoc);
+      const docId = normalized.id as string;
+
+      this.textIndex.addDocument(docId, normalized);
+
+      for (const [field, config] of Object.entries(this.schema)) {
+        if (config.type === 'vector' && normalized[field] !== undefined) {
+          this.vectorIndex.addVector(docId, normalized[field] as number[] | Float32Array);
+          this.vectorIndexDirty = true;
+        }
+      }
+
+      const storedDoc: Document = { ...normalized };
+      for (const [field, config] of Object.entries(this.schema)) {
+        if (config.stored === false) {
+          delete storedDoc[field];
+        }
+      }
+      this.documents.set(docId, storedDoc);
+      this.pluginManager.runAfterAdd(storedDoc, {});
+    }
+  }
+
+  /**
+   * Expose the Transaction staging wrapper API.
+   */
+  public transaction(): Transaction<S> {
+    return new Transaction(this);
+  }
+
+  /**
    * Remove a document by ID.
    */
   public remove(id: string): void {
@@ -113,6 +169,7 @@ export class NanoSearch<S extends Schema> {
 
     this.textIndex.removeDocument(idStr);
     this.vectorIndex.removeVector(idStr);
+    this.vectorIndexDirty = true;
     this.documents.delete(idStr);
 
     this.pluginManager.runAfterRemove(idStr);
@@ -175,6 +232,12 @@ export class NanoSearch<S extends Schema> {
       }
     }
 
+    // Lazy rebuild VP-Tree if dirty
+    if (this.vectorIndexType === 'vptree' && this.vectorIndexDirty && this.vpTree) {
+      this.vpTree.rebuild();
+      this.vectorIndexDirty = false;
+    }
+
     // 2. Perform Text & Vector Search
     let textResults: { docId: string; score: number; termsMatched: string[] }[] = [];
     let vectorResults: { docId: string; score: number }[] = [];
@@ -197,20 +260,26 @@ export class NanoSearch<S extends Schema> {
           opts.boosts,
           {
             enabled: opts.typoTolerance?.enabled ?? true,
-            maxDistance: opts.typoTolerance?.maxDistance ?? 1
+            maxDistance: opts.typoTolerance?.maxDistance ?? 1,
+            minWordLength: opts.typoTolerance?.minWordLength
           }
         );
       }
     }
 
     if (opts.vector) {
-      vectorResults = this.vectorIndex.search(opts.vector, this.documents.size, candidateIds);
+      if (this.vectorIndexType === 'vptree' && this.vpTree) {
+        const searchLimit = Math.min(this.documents.size, Math.max(100, (opts.limit || 10) * 5));
+        vectorResults = this.vpTree.search(opts.vector as Float32Array, searchLimit, candidateIds);
+      } else {
+        vectorResults = this.vectorIndex.search(opts.vector, this.documents.size, candidateIds);
+      }
     }
 
     // Filter text results to match candidateIds
     textResults = textResults.filter(r => candidateIds.has(r.docId));
 
-    // 3. Fusion & Hybrid blending
+    // 3. Hybrid Rank Fusion & Blending
     let hits: SearchHit<Document>[] = [];
 
     const hybridMode = opts.hybrid?.mode || 'weighted';
@@ -254,10 +323,28 @@ export class NanoSearch<S extends Schema> {
           }
         }
       } else {
-        // Weighted linear combination
-        // Find max scores for normalization, clamped to avoid division by <= 0
-        const maxText = Math.max(0.0001, textResults[0]?.score || 1);
-        const maxVector = Math.max(0.0001, vectorResults[0]?.score || 1);
+        // Weighted linear combination with Min-Max normalization
+        let minText = Infinity;
+        let maxText = -Infinity;
+        const textLen = textResults.length;
+        for (let i = 0; i < textLen; i++) {
+          const s = textResults[i].score;
+          if (s < minText) minText = s;
+          if (s > maxText) maxText = s;
+        }
+        if (minText === Infinity) { minText = 0; maxText = 1; }
+        else if (maxText === minText) { minText = 0; maxText = Math.max(0.0001, maxText); }
+
+        let minVec = Infinity;
+        let maxVec = -Infinity;
+        const vecLen = vectorResults.length;
+        for (let i = 0; i < vecLen; i++) {
+          const s = vectorResults[i].score;
+          if (s < minVec) minVec = s;
+          if (s > maxVec) maxVec = s;
+        }
+        if (minVec === Infinity) { minVec = 0; maxVec = 1; }
+        else if (maxVec === minVec) { minVec = 0; maxVec = Math.max(0.0001, maxVec); }
 
         const textScores = new Map<string, number>();
         textResults.forEach(r => textScores.set(r.docId, r.score));
@@ -265,12 +352,15 @@ export class NanoSearch<S extends Schema> {
         const vectorScores = new Map<string, number>();
         vectorResults.forEach(r => vectorScores.set(r.docId, r.score));
 
+        const denomText = maxText - minText || 1;
+        const denomVec = maxVec - minVec || 1;
+
         for (const docId of candidateIds) {
           const rawText = textScores.get(docId) || 0;
           const rawVec = vectorScores.get(docId) || 0;
 
-          const normText = rawText / maxText;
-          const normVec = rawVec / maxVector;
+          const normText = (rawText - minText) / denomText;
+          const normVec = (rawVec - minVec) / denomVec;
 
           const finalScore = weightText * normText + weightVector * normVec;
 

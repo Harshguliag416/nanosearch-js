@@ -101,6 +101,7 @@ export interface SearchOptions<S extends Schema> {
   typoTolerance?: {
     enabled?: boolean;
     maxDistance?: 1 | 2; // Levenshtein limit
+    minWordLength?: number;
   };
   highlight?: boolean;   // Return matching tokens and boundary offsets
 }

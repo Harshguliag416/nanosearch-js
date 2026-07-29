@@ -132,7 +132,7 @@ export class BM25TextIndex {
     queryText: string,
     searchFields: string[],
     fieldBoosts: Record<string, number> = {},
-    typoToleranceOpts: { enabled?: boolean; maxDistance?: 1 | 2 } = {}
+    typoToleranceOpts: { enabled?: boolean; maxDistance?: 1 | 2; minWordLength?: number } = {}
   ): { docId: string; score: number; termsMatched: string[] }[] {
     const queryTokens = this.tokenizer.tokenize(queryText);
     if (queryTokens.length === 0) return [];
@@ -157,7 +157,8 @@ export class BM25TextIndex {
         }
 
         // Fuzzy match if enabled
-        if (typoToleranceOpts.enabled && fuzzyIndex) {
+        const minWordLen = typoToleranceOpts.minWordLength ?? 0;
+        if (typoToleranceOpts.enabled && fuzzyIndex && queryToken.length >= minWordLen) {
           const fuzzyResults = fuzzyIndex.search(queryToken, typoToleranceOpts.maxDistance || 1);
           for (const res of fuzzyResults) {
             if (res.term !== queryToken) {

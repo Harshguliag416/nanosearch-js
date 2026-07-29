@@ -1,6 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { NanoSearch, Schema, NanoSearchPlugin, Document } from '../src/index.js';
-
+import { NanoSearch, Schema, NanoSearchPlugin, Document, PorterStemmerPlugin } from '../src/index.js';
 describe('NanoSearch Tests', () => {
   const schema: Schema = {
     title: { type: 'text', boost: 2.0 },
@@ -276,5 +275,85 @@ describe('NanoSearch Tests', () => {
     const results = restored.search({ query: 'React' });
     expect(results.hits).toHaveLength(1);
     expect(results.hits[0].id).toBe('1');
+  });
+
+  test('v1.1.0: Transaction staged additions and commit', () => {
+    const searchEngine = new NanoSearch(schema);
+    const tx = searchEngine.transaction();
+    
+    tx.add({ id: 'tx-1', title: 'Transaction doc A', category: 'News' });
+    tx.addMany([
+      { id: 'tx-2', title: 'Transaction doc B', category: 'Tech' },
+      { id: 'tx-3', title: 'Transaction doc C', category: 'Tech' }
+    ]);
+    tx.remove('tx-1');
+
+    // Should not exist in main index before commit
+    expect(searchEngine.get('tx-2')).toBeUndefined();
+
+    tx.commit();
+
+    expect(searchEngine.get('tx-1')).toBeUndefined(); // removed
+    expect(searchEngine.get('tx-2')).toBeDefined();
+    expect(searchEngine.get('tx-3')).toBeDefined();
+
+    const results = searchEngine.search({ query: 'Transaction' });
+    expect(results.hits).toHaveLength(2);
+  });
+
+  test('v1.1.0: Vantage Point Tree vector search', () => {
+    const searchEngine = new NanoSearch(schema, {
+      vectorMetric: 'cosine',
+      vectorDimensions: 3,
+      vectorIndexType: 'vptree'
+    });
+
+    searchEngine.add({ id: '1', embedding: [1, 0, 0] });
+    searchEngine.add({ id: '2', embedding: [0, 1, 0] });
+    searchEngine.add({ id: '3', embedding: [0.9, 0.1, 0.0] });
+
+    const results = searchEngine.search({
+      vector: [1, 0.05, 0.0],
+      limit: 2
+    });
+
+    expect(results.hits[0].id).toBe('1');
+    expect(results.hits[1].id).toBe('3');
+  });
+
+  test('v1.1.0: Pluggable stemmer plugin', () => {
+    const searchEngine = new NanoSearch(schema);
+    searchEngine.use(PorterStemmerPlugin(['title', 'description']));
+
+    searchEngine.add({
+      id: 'stem-1',
+      title: 'Connecting people and testing connections',
+      description: 'Stems strings accurately'
+    });
+
+    // Query "connection" should match "connections" and "connecting" because they are stemmed to "connect"
+    const results = searchEngine.search({ query: 'connections' });
+    expect(results.hits).toHaveLength(1);
+    expect(results.hits[0].id).toBe('stem-1');
+  });
+
+  test('v1.1.0: minWordLength fuzzy thresholds', () => {
+    const searchEngine = new NanoSearch(schema);
+    searchEngine.add({ id: '1', title: 'App' });
+    searchEngine.add({ id: '2', title: 'Application' });
+
+    // Fuzzy search for "Ap" should NOT match "App" if minWordLength is 4
+    let results = searchEngine.search({
+      query: 'Ap',
+      typoTolerance: { enabled: true, maxDistance: 1, minWordLength: 4 }
+    });
+    expect(results.hits).toHaveLength(0);
+
+    // Fuzzy search for "Applicatio" should match "Application"
+    results = searchEngine.search({
+      query: 'Applicatio',
+      typoTolerance: { enabled: true, maxDistance: 1, minWordLength: 4 }
+    });
+    expect(results.hits).toHaveLength(1);
   });
 });

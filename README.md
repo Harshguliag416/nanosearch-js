@@ -112,5 +112,93 @@ searchEngine.use(autoTimestampPlugin);
 |---|---|---|
 | Ingestion (Text) | $O(W \cdot L)$ | $W$ words, average length $L$. |
 | Typo-Fuzzy Lookup | $O(d)$ | $d$ deletion variants, bypassing expensive $O(N)$ scanning. |
-| Vector Search | $O(N \cdot D)$ | $N$ document count, $D$ vector dimensions. |
+| Vector Search (Exact) | $O(N \cdot D)$ | $N$ document count, $D$ vector dimensions. |
+| Vector Search (VP-Tree) | $O(D \cdot \log N)$ | Vantage Point Tree ANN indexing. |
 | Filtering | $O(N)$ | Instant filter matching. |
+
+---
+
+## v1.1.0 New Features
+
+### 1. Batch Indexing & Transactions
+Stage multiple document additions or removals without re-triggering BM25 statistics recalculation on every addition:
+
+```typescript
+const tx = searchEngine.transaction();
+tx.add({ id: 'doc-1', title: 'Staged Doc A' });
+tx.addMany([ ...moreDocs ]);
+tx.remove('doc-2');
+
+// Rebuilds indices and statistics in a single pass
+tx.commit();
+```
+
+### 2. Vantage Point (VP) Tree Vector Search
+Enable sub-linear $O(\log N)$ Approximate Nearest Neighbor (ANN) search for Cosine and Euclidean metrics:
+
+```typescript
+const searchEngine = new NanoSearch(schema, {
+  vectorMetric: 'cosine',
+  vectorDimensions: 1536,
+  vectorIndexType: 'vptree' // Choose 'exact' (default) or 'vptree'
+});
+```
+
+### 3. Pluggable Stemmer Analyzer
+Use the optional Porter Stemmer plugin to stem document fields and search queries:
+
+```typescript
+import { PorterStemmerPlugin } from 'nanosearch-js';
+
+searchEngine.use(PorterStemmerPlugin(['title', 'body']));
+```
+
+### 4. Fuzzy Query Options
+Filter typo-tolerance results dynamically by word length:
+
+```typescript
+const results = searchEngine.search({
+  query: 'comp',
+  typoTolerance: {
+    enabled: true,
+    maxDistance: 1,
+    minWordLength: 4 // Typo tolerance only triggers for query tokens >= 4 chars
+  }
+});
+```
+
+---
+
+## RAG & LLM Integration (`nanosearch-js/rag`)
+
+NanoSearch includes a provider-independent RAG orchestration layer containing sliding window chunking, hybrid retrieval context assembly, history management, and LLM generation.
+
+### Quick Start
+```typescript
+import { NanoSearch, Schema } from 'nanosearch-js';
+import { RAGPipeline, OpenAIProvider } from 'nanosearch-js/rag';
+
+const schema = {
+  content: { type: 'text' },
+  embedding: { type: 'vector' }
+} as const satisfies Schema;
+
+const searchEngine = new NanoSearch(schema, { vectorDimensions: 1536 });
+const openai = new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY });
+
+const pipeline = new RAGPipeline({
+  searchEngine,
+  embeddingProvider: openai,
+  llmProvider: openai,
+  textField: 'content',
+  vectorField: 'embedding'
+});
+
+// Index a document
+await pipeline.addDocument('doc-1', 'NanoSearch RAG is extremely fast and lightweight.');
+
+// Run RAG query
+const response = await pipeline.query('Is NanoSearch RAG lightweight?');
+console.log(response.answer); // Answer citing source chunks
+```
+
